@@ -1,19 +1,37 @@
-// Core FTFL contract math. Every function here is pure — no I/O, no state.
-// This is the "basic settings" logic: escalation and years-remaining are
-// computed, never hand-typed. Commissioner only ever edits the raw fields
-// below (baseSalary, startYear, lengthYears) when a deal actually changes.
+// Core FTFL contract math. Two kinds of contract, one shared interface:
+//
+// - "imported" contracts are real history, copied verbatim from the master
+//   spreadsheet. Their per-year salary is whatever is actually in the
+//   sheet — never recomputed, because the escalation rule wasn't applied
+//   consistently across 9 years of manual edits and renegotiations.
+// - "formula" contracts are new deals signed going forward, through the
+//   commissioner screen. Their salary in any year is always computed from
+//   the confirmed escalation rule — never hand-typed.
+//
+// Every function below is pure — no I/O, no state.
 
-export interface Contract {
+interface BaseContract {
   id: string;
   playerName: string;
   position: string;
-  team: string;
+  team: string; // team slug, see data/teams.ts
+  taxiYears?: number[];
+  irYears?: number[];
+}
+
+export interface ImportedContract extends BaseContract {
+  kind: 'imported';
+  yearSalaries: Record<number, number>;
+}
+
+export interface FormulaContract extends BaseContract {
+  kind: 'formula';
   baseSalary: number; // salary in the FIRST year of this contract
   startYear: number;
   lengthYears: number;
-  taxi?: boolean;
-  ir?: boolean;
 }
+
+export type Contract = ImportedContract | FormulaContract;
 
 export const SALARY_CAP = 200;
 
@@ -24,23 +42,50 @@ export function annualIncrement(baseSalary: number): number {
   return 5;
 }
 
-/** Contract's final year, inclusive. */
+/** Every year this contract has a salary on record, sorted ascending. */
+export function activeYears(contract: Contract): number[] {
+  if (contract.kind === 'imported') {
+    return Object.keys(contract.yearSalaries)
+      .map(Number)
+      .sort((a, b) => a - b);
+  }
+  const years: number[] = [];
+  for (let i = 0; i < contract.lengthYears; i++) years.push(contract.startYear + i);
+  return years;
+}
+
 export function endYear(contract: Contract): number {
-  return contract.startYear + contract.lengthYears - 1;
+  const years = activeYears(contract);
+  return years[years.length - 1];
+}
+
+export function startYear(contract: Contract): number {
+  const years = activeYears(contract);
+  return years[0];
+}
+
+/** The salary in the final year on record — the only real anchor we have
+ * for what a new deal might cost, since actual re-sign price is market
+ * value at the time (not something this app calculates). */
+export function finalYearSalary(contract: Contract): number | null {
+  return salaryInYear(contract, endYear(contract));
 }
 
 /**
- * Salary in a given year. Returns null if the contract isn't active that
- * year (expired, or hasn't started yet) rather than 0, so callers can
- * distinguish "no cost" from "not on this deal."
+ * Salary in a given year. Returns null if the contract has no salary on
+ * record for that year (expired, not started, or simply not entered).
  */
 export function salaryInYear(contract: Contract, year: number): number | null {
+  if (contract.kind === 'imported') {
+    return contract.yearSalaries[year] ?? null;
+  }
   const yearsIn = year - contract.startYear;
   if (yearsIn < 0 || yearsIn >= contract.lengthYears) return null;
   return contract.baseSalary + annualIncrement(contract.baseSalary) * yearsIn;
 }
 
 export function yearsRemaining(contract: Contract, asOfYear: number): number {
+  if (salaryInYear(contract, asOfYear) == null) return 0;
   return Math.max(0, endYear(contract) - asOfYear);
 }
 
@@ -51,15 +96,32 @@ export function yearsRemaining(contract: Contract, asOfYear: number): number {
  */
 export function cutPenalty(contract: Contract, cutYear: number): number {
   let total = 0;
-  for (let y = cutYear + 1; y <= endYear(contract); y++) {
+  for (const y of activeYears(contract)) {
+    if (y <= cutYear) continue;
     const sal = salaryInYear(contract, y);
     if (sal != null) total += Math.ceil(sal * 0.5);
   }
   return total;
 }
 
+export function isTaxi(contract: Contract, year: number): boolean {
+  return contract.taxiYears?.includes(year) ?? false;
+}
+
+export function isIR(contract: Contract, year: number): boolean {
+  return contract.irYears?.includes(year) ?? false;
+}
+
+/** Confirmed rule: taxi squad and IR contracts do NOT count against the cap. */
+export function countsAgainstCap(contract: Contract, year: number): boolean {
+  return !isTaxi(contract, year) && !isIR(contract, year);
+}
+
 export function teamCapUsed(contracts: Contract[], year: number): number {
-  return contracts.reduce((sum, c) => sum + (salaryInYear(c, year) ?? 0), 0);
+  return contracts.reduce((sum, c) => {
+    if (!countsAgainstCap(c, year)) return sum;
+    return sum + (salaryInYear(c, year) ?? 0);
+  }, 0);
 }
 
 export function teamCapSpace(contracts: Contract[], year: number, capLimit = SALARY_CAP): number {
@@ -68,4 +130,16 @@ export function teamCapSpace(contracts: Contract[], year: number, capLimit = SAL
 
 export function contractsForTeam(contracts: Contract[], teamSlug: string): Contract[] {
   return contracts.filter((c) => c.team === teamSlug);
+}
+
+export function rosterCount(contracts: Contract[], year: number): number {
+  return contracts.filter((c) => salaryInYear(c, year) != null && countsAgainstCap(c, year)).length;
+}
+
+export function taxiCount(contracts: Contract[], year: number): number {
+  return contracts.filter((c) => isTaxi(c, year)).length;
+}
+
+export function irCount(contracts: Contract[], year: number): number {
+  return contracts.filter((c) => isIR(c, year)).length;
 }
